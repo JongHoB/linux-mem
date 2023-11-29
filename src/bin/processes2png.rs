@@ -56,6 +56,7 @@ fn main() {
         .filter_map(|res| res.ok())
         .collect();
 
+    // scan all processes
     let mut pfn_set = HashSet::new();
     for p in processes.iter() {
         let some_pfns = match handle_process(p) {
@@ -102,6 +103,7 @@ fn main() {
         }
     }
 
+    // draw the process pages
     for &pfn in &pfn_set {
         if pfn.0 == 0 {
             continue;
@@ -120,4 +122,16 @@ fn main() {
     }
 
     img.save("img.png").unwrap();
+
+    //print the number of pages used in ram
+    println!("{} pages in ram", pfn_set.len());
+
+    //print the nr_free_pages in /proc/vmstat
+    let vmstat = procfs::vmstat().unwrap();
+    let nr_free_pages = vmstat.get("nr_free_pages");
+match nr_free_pages {
+    Some(value) => println!("nr_free_pages: {}", value),
+    None => println!("nr_free_pages key not found"),
+}
+
 }
