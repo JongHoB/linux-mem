@@ -1,5 +1,5 @@
 #![feature(extract_if)]
-#![feature(setgroups)]
+#![cfg_attr(target_os = "linux", feature(setgroups))]
 #![allow(non_snake_case)]
 
 // https://biriukov.dev/docs/page-cache/4-page-cache-eviction-and-page-reclaim/
@@ -10,11 +10,21 @@
 // pahole -C task_struct /sys/kernel/btf/vmlinux
 
 use itertools::Itertools;
+
+#[cfg(unix)]
 use procfs::{
     page_size,
-    process::{MMapPath, Pfn, Process},
-    PhysicalMemoryMap, PhysicalPageFlags,
+    process::{MMapPath, Process},
+    process::{MemoryMap, PageInfo},
+    Shm, WithCurrentSystemInfo,
 };
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+use procfs_core::{
+    process::Pfn, ExplicitSystemInfo, PhysicalMemoryMap, PhysicalPageFlags, WithSystemInfo,
+};
+
 use rayon::prelude::ParallelExtend;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,23 +32,22 @@ use std::{
     ffi::OsStr,
     fmt::{Debug, Display},
     hash::BuildHasherDefault,
-    os::unix::process::CommandExt,
     process::{Command, Stdio},
     str::FromStr,
 };
 
 use log::{info, warn};
-use procfs::{
-    process::{MemoryMap, PageInfo},
-    Shm,
-};
 
 use oracle::{Connector, Privilege};
 use std::ffi::OsString;
 
+#[cfg(unix)]
 pub mod filters;
+#[cfg(unix)]
 pub mod groups;
+#[cfg(unix)]
 pub mod process_tree;
+#[cfg(unix)]
 pub mod tmpfs;
 
 /// Convert pfn to index into non-contiguous memory mappings
@@ -49,11 +58,34 @@ pub fn pfn_to_index(iomem: &[PhysicalMemoryMap], page_size: u64, pfn: Pfn) -> Op
 
     let mut previous_maps_size = 0;
     for map in iomem {
-        let (pfn_start, pfn_end) = (map.address.0 / page_size, map.address.1 / page_size);
-        if pfn.0 <= pfn_end {
-            return Some(previous_maps_size + pfn.0 - pfn_start);
+        assert_eq!(map.name, "System RAM");
+        let (pfn_start, pfn_end) = (
+            Pfn(map.address.0 / page_size),
+            Pfn(map.address.1 / page_size),
+        );
+        if pfn < pfn_start {
+            return None;
         }
-        previous_maps_size += pfn_end - pfn_start;
+        if pfn <= pfn_end {
+            return Some(previous_maps_size + pfn.0 - pfn_start.0);
+        }
+        previous_maps_size += pfn_end.0 - pfn_start.0 + 1;
+    }
+    None
+}
+
+/// Convert index to Pfn into non-contiguous memory mappings
+pub fn index_to_pfn(iomem: &[PhysicalMemoryMap], page_size: u64, mut index: u64) -> Option<Pfn> {
+    for map in iomem {
+        assert_eq!(map.name, "System RAM");
+        let (pfn_start, pfn_end) = (
+            Pfn(map.address.0 / page_size),
+            Pfn(map.address.1 / page_size),
+        );
+        if index <= pfn_end.0 - pfn_start.0 {
+            return Some(Pfn(index + pfn_start.0));
+        }
+        index -= pfn_end.0 - pfn_start.0 + 1;
     }
     None
 }
@@ -75,10 +107,21 @@ pub fn pfn_is_in_ram(iomem: &[PhysicalMemoryMap], page_size: u64, pfn: Pfn) -> O
 }
 
 /// Count total number of 4 kiB frames in memory segments
-pub fn get_pfn_count(iomem: &[PhysicalMemoryMap], page_size: u64) -> u64 {
+pub fn get_pfn_count(iomem: &[PhysicalMemoryMap]) -> u64 {
     iomem
         .iter()
-        .map(|map| map.address.1 / page_size - map.address.0 / page_size)
+        .map(|map| {
+            //let (start, end) = map.get_range().get();
+            //(map.address.1 - map.address.0) / 4096
+            let system_info = ExplicitSystemInfo {
+                boot_time_secs: 0,
+                is_little_endian: false,
+                page_size: 4096,
+                ticks_per_second: 1000,
+            };
+            let (start, end) = map.get_range().with_system_info(&system_info);
+            end.0 - start.0
+        })
         .sum()
 }
 
@@ -117,15 +160,13 @@ pub const FLAG_NAMES: [&str; 27] = [
     "PGTABLE",
 ];
 
-pub fn compute_compound_pages(
-    data: &[(Pfn, u64, PhysicalPageFlags)],
-) -> [u64; FLAG_NAMES.len() + 1] {
+pub fn compute_compound_pages(data: &[PhysicalPageFlags]) -> [u64; FLAG_NAMES.len() + 1] {
     let mut counters = [0u64; FLAG_NAMES.len() + 1];
 
     #[allow(unused_variables)]
     let mut merged_compound_pages = 0;
     let mut iter = data.iter().peekable();
-    while let Some(&(_pfn, _count, flags)) = iter.next() {
+    while let Some(&flags) = iter.next() {
         if flags.contains(PhysicalPageFlags::COMPOUND_HEAD) {
             let head_flags = flags;
             //println!("0: {:?}", head_flags);
@@ -136,11 +177,8 @@ pub fn compute_compound_pages(
                 }
             }
 
-            for (_i, &(_pfn, _count, flags)) in iter
-                .take_while_ref(|(_pfn, _count, flags)| {
-                    flags.contains(PhysicalPageFlags::COMPOUND_TAIL)
-                })
-                .enumerate()
+            for &flags in
+                iter.take_while_ref(|flags| flags.contains(PhysicalPageFlags::COMPOUND_TAIL))
             {
                 merged_compound_pages += 1;
                 let mut tail_flags = flags;
@@ -172,25 +210,9 @@ pub fn compute_compound_pages(
     counters
 }
 
-pub fn print_counters(counters: [u64; FLAG_NAMES.len() + 1]) {
-    for (name, value) in FLAG_NAMES.iter().zip(counters) {
-        let size = humansize::format_size(
-            value * procfs::page_size(),
-            humansize::BINARY.fixed_at(Some(humansize::FixedAt::Kilo)),
-        );
-        println!("{:15}: {}", name, size);
-    }
-
-    //let total_size = data.len() as u64 * procfs::page_size();
-    //let total_size = humansize::format_size(
-    //    total_size,
-    //    humansize::BINARY.fixed_at(Some(humansize::FixedAt::Kilo)),
-    //);
-    //println!("{:15}: {}", "Total", total_size);
-}
-
 /// Scan each page of shm
 /// Return None if shm uses any swap
+#[cfg(unix)]
 pub fn shm2pfns(
     all_physical_pages: &HashMap<Pfn, PhysicalPageFlags>,
     shm: &Shm,
@@ -301,6 +323,7 @@ pub fn shm2pfns(
 /// Return size of (files_struct, task_struct) from kernel
 /// ./pahole -C files_struct /sys/kernel/btf/vmlinux
 /// ./pahole -C task_struct /sys/kernel/btf/vmlinux
+#[cfg(unix)]
 pub fn get_kernel_datastructure_size(
     current_kernel: procfs::sys::kernel::Version,
 ) -> Option<(u64, u64)> {
@@ -329,6 +352,7 @@ pub fn get_kernel_datastructure_size(
 }
 
 /// If optimize_shm if true, only return first 10 pages for a shared memory mapping
+#[cfg(unix)]
 pub fn get_memory_maps_for_process(
     process: &Process,
     optimize_shm: bool,
@@ -418,6 +442,7 @@ pub fn get_db_info() -> Result<(u64, u64, u64, LargePages), Box<dyn std::error::
 
 /// Find smons processes
 /// For each, return (pid, uid, ORACLE_SID, ORACLE_HOME)
+#[cfg(unix)]
 pub fn find_smons() -> Vec<(i32, u32, OsString, OsString)> {
     let smons: Vec<Process> = procfs::process::all_processes()
         .unwrap()
@@ -466,6 +491,7 @@ pub type TheHash = metrohash::MetroHash;
 #[cfg(feature = "fxhash")]
 pub type TheHash = rustc_hash::FxHasher;
 
+#[cfg(unix)]
 pub type ShmsMetadata = HashMap<
     procfs::Shm,
     Option<(HashSet<Pfn>, HashSet<(u64, u64)>, usize, usize)>,
@@ -478,6 +504,7 @@ pub struct ShmReference {
     shmid: u64,
 }
 
+#[cfg(unix)]
 pub struct ProcessInfo {
     pub process: Process,
     pub uid: u32,
@@ -494,6 +521,7 @@ pub struct ProcessInfo {
     pub unknown_shm: HashSet<ShmReference>,
 }
 
+#[cfg(unix)]
 pub struct ProcessGroupInfo {
     pub name: String,
     pub processes_info: Vec<ProcessInfo>,
@@ -506,12 +534,14 @@ pub struct ProcessGroupInfo {
     pub fds: usize,
 }
 
+#[cfg(unix)]
 impl PartialEq for ProcessGroupInfo {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
     }
 }
 
+#[cfg(unix)]
 impl Debug for ProcessGroupInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProcessGroupInfo")
@@ -539,13 +569,14 @@ pub struct SmonInfo {
 }
 
 // return info memory maps info for standard process or None for kernel process
+#[cfg(unix)]
 pub fn get_process_info(
     process: Process,
     shms_metadata: &ShmsMetadata,
 ) -> Result<ProcessInfo, Box<dyn std::error::Error>> {
     if process.cmdline()?.is_empty() {
         // already handled in main
-        return Err(String::from("No info for kernel process"))?;
+        Err(String::from("No info for kernel process"))?
     }
 
     let page_size = procfs::page_size();
@@ -671,6 +702,7 @@ pub fn get_process_info(
     })
 }
 
+#[cfg(unix)]
 pub fn get_processes_group_info(
     processes_info: Vec<ProcessInfo>,
     name: &str,
@@ -710,6 +742,7 @@ pub fn get_processes_group_info(
 
 /// Spawn new process with database user
 /// return smon info
+#[cfg(unix)]
 pub fn get_smon_info(
     pid: i32,
     uid: u32,
@@ -718,7 +751,7 @@ pub fn get_smon_info(
 ) -> Result<SmonInfo, Box<dyn std::error::Error>> {
     let myself = std::env::current_exe()?;
 
-    let user = users::get_user_by_uid(uid).expect("Can't find user for uid {uid}");
+    let user = uzers::get_user_by_uid(uid).expect("Can't find user for uid {uid}");
     let gid = user.primary_group_id();
 
     let mut lib = home.to_os_string();
